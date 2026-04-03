@@ -18,8 +18,11 @@ TWITTER_BEARER_TOKEN = os.environ["TWITTER_BEARER_TOKEN"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
 
-TWITTER_USERNAME = "pewpiece"
-POLL_INTERVAL = 900  # 15 minutes
+# Changed to a list for multiple accounts
+TWITTER_USERNAMES = ["pewpiece", "REIGEN326781"]
+
+# --- CHANGED TO 30 SECONDS FOR TESTING ---
+POLL_INTERVAL = 30  
 
 client = tweepy.Client(bearer_token=TWITTER_BEARER_TOKEN, wait_on_rate_limit=True)
 
@@ -28,7 +31,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Bot is alive and polling!", 200
+    return "Bot is alive and polling multiple accounts!", 200
 
 def run_flask():
     # Render provides a PORT environment variable
@@ -42,8 +45,8 @@ def get_user_id(username: str) -> str:
     if not response.data:
         raise RuntimeError(f"Could not find Twitter user @{username}")
     user_id = response.data.id
-    logger.info(f"Found user ID: {user_id}")
-    return user_id
+    logger.info(f"Found user ID for @{username}: {user_id}")
+    return str(user_id)
 
 def fetch_new_tweets(user_id: str, since_id: str | None):
     kwargs = {
@@ -64,8 +67,8 @@ def telegram_request(method: str, payload: dict) -> dict:
         logger.warning(f"Telegram {method} failed: {data}")
     return data
 
-def send_tweet_to_telegram(tweet_text: str, image_urls: list[str]):
-    caption = f"🏴‍☠️ <b>One Piece Spoiler from @pewpiece</b>\n\n{tweet_text}"
+def send_tweet_to_telegram(username: str, tweet_text: str, image_urls: list[str]):
+    caption = f"🏴‍☠️ <b>Update from @{username}</b>\n\n{tweet_text}"
     if not image_urls:
         telegram_request("sendMessage", {"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML"})
     elif len(image_urls) == 1:
@@ -99,34 +102,51 @@ def extract_image_urls(response) -> dict[str, list[str]]:
     return tweet_media
 
 def run_bot():
-    logger.info("Starting One Piece spoiler bot polling...")
-    user_id = get_user_id(TWITTER_USERNAME)
-    last_tweet_id = None
+    logger.info("Starting bot polling for multiple accounts...")
+    
+    users = {}  # Stores user_id -> username
+    last_tweet_ids = {}  # Stores user_id -> last_tweet_id
 
-    try:
-        initial = fetch_new_tweets(user_id, since_id=None)
-        if initial.data:
-            last_tweet_id = str(initial.data[0].id)
-            logger.info(f"Starting from tweet ID: {last_tweet_id}")
-    except Exception as e:
-        logger.error(f"Initial fetch error: {e}")
-
-    while True:
+    # Initial setup for all usernames
+    for username in TWITTER_USERNAMES:
         try:
-            response = fetch_new_tweets(user_id, since_id=last_tweet_id)
-            if response.data:
-                image_url_map = extract_image_urls(response)
-                for tweet in reversed(response.data):
-                    send_tweet_to_telegram(tweet.text, image_url_map.get(str(tweet.id), []))
-                    time.sleep(1)
-                last_tweet_id = str(response.data[0].id)
+            user_id = get_user_id(username)
+            users[user_id] = username
+            
+            initial = fetch_new_tweets(user_id, since_id=None)
+            if initial.data:
+                last_tweet_ids[user_id] = str(initial.data[0].id)
+                logger.info(f"Starting @{username} from tweet ID: {last_tweet_ids[user_id]}")
             else:
-                logger.info("No new tweets.")
-        except tweepy.errors.TooManyRequests:
-            time.sleep(POLL_INTERVAL)
+                last_tweet_ids[user_id] = None
+                logger.info(f"No existing tweets found for @{username}.")
         except Exception as e:
-            logger.error(f"Poll error: {e}")
-        
+            logger.error(f"Initial setup error for @{username}: {e}")
+
+    # Main polling loop
+    while True:
+        for user_id, username in users.items():
+            try:
+                since_id = last_tweet_ids.get(user_id)
+                response = fetch_new_tweets(user_id, since_id=since_id)
+                
+                if response.data:
+                    image_url_map = extract_image_urls(response)
+                    for tweet in reversed(response.data):
+                        send_tweet_to_telegram(username, tweet.text, image_url_map.get(str(tweet.id), []))
+                        time.sleep(1)
+                    last_tweet_ids[user_id] = str(response.data[0].id)
+                else:
+                    logger.info(f"No new tweets for @{username}.")
+            except tweepy.errors.TooManyRequests:
+                logger.warning(f"Rate limited while checking @{username}.")
+            except Exception as e:
+                logger.error(f"Poll error for @{username}: {e}")
+            
+            # Small 5 second delay between checking different users to prevent instant API spam
+            time.sleep(5)
+            
+        logger.info(f"Cycle finished. Sleeping for {POLL_INTERVAL} seconds.")
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
