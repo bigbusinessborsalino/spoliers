@@ -3,7 +3,9 @@ import time
 import logging
 import requests
 import threading
+import re
 from flask import Flask
+from pymongo import MongoClient
 from playwright.sync_api import sync_playwright
 
 # Logging setup
@@ -16,16 +18,29 @@ logger = logging.getLogger(__name__)
 # Environment Variables
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
+MONGO_URI = os.environ["MONGO_URI"]
 
 TWITTER_USERNAMES = ["pewpiece", "REIGEN326781"]
-POLL_INTERVAL = 30  # Keep at 30 for testing
+POLL_INTERVAL = 30  # Testing mode
+
+# --- MONGODB SETUP ---
+try:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client["spoiler_bot_db"]
+    posted_tweets = db["posted_tweets"]
+    # Ensure MongoDB is actually connected
+    mongo_client.admin.command('ping')
+    logger.info("Successfully connected to MongoDB!")
+except Exception as e:
+    logger.error(f"MongoDB Connection Error: {e}")
+    raise e
 
 # --- DUMMY SERVER FOR RENDER ---
 app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "Bot is alive and scraping with Playwright!", 200
+    return "Bot is alive, connected to MongoDB, and scraping!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -41,7 +56,7 @@ def telegram_request(method: str, payload: dict) -> dict:
     return data
 
 def send_tweet_to_telegram(username: str, tweet_text: str, image_urls: list[str]):
-    caption = f"🏴‍☠️ <b>Update from @{username}</b>\n\n{tweet_text}"
+    caption = f"🏴‍☠️ <b>One Piece Spoiler from @{username}</b>\n\n{tweet_text}"
     if not image_urls:
         telegram_request("sendMessage", {"chat_id": TELEGRAM_CHANNEL_ID, "text": caption, "parse_mode": "HTML"})
     elif len(image_urls) == 1:
@@ -70,21 +85,26 @@ def scrape_twitter(username: str, page):
         # Grab all tweet elements on the page
         tweet_elements = page.query_selector_all('[data-testid="tweet"]')
         
-        # Scrape the first 3 tweets to look for new ones
-        for element in tweet_elements[:3]:
+        # Scrape the first 5 tweets
+        for element in tweet_elements[:5]:
             # Extract text
             text_el = element.query_selector('[data-testid="tweetText"]')
             text = text_el.inner_text() if text_el else ""
             
+            # Filter: ONLY keep tweets that contain "#ONEPIECE" (case-insensitive)
+            # This will match #ONEPIECE, #OnePiece1179, #onepiece, etc.
+            # \d+ means "one or more digits". This perfectly matches #ONEPIECE1180, #ONEPIECE1181, etc.
+            if not re.search(r'#ONEPIECE\d+', text, re.IGNORECASE):
+                continue
+                
             # Extract images
             img_els = element.query_selector_all('[data-testid="tweetPhoto"] img')
             images = [img.get_attribute('src') for img in img_els if img.get_attribute('src')]
             
-            # Clean up image URLs (Twitter often uses small thumbnails, we want the high res)
+            # Clean up image URLs to get high res
             high_res_images = [img.replace('&name=small', '&name=large') for img in images]
             
-            if text or high_res_images:
-                tweets_data.append({'text': text, 'images': high_res_images})
+            tweets_data.append({'text': text, 'images': high_res_images})
             
         return tweets_data
         
@@ -93,14 +113,9 @@ def scrape_twitter(username: str, page):
         return []
 
 def run_bot():
-    logger.info("Starting Playwright scraper bot...")
+    logger.info("Starting Playwright scraper bot with MongoDB...")
     
-    # Track the text of tweets we've already sent to avoid spamming
-    # Maps username -> list of recent tweet texts
-    seen_tweets = {u: [] for u in TWITTER_USERNAMES}
-
     with sync_playwright() as p:
-        # Launch Chromium with extreme memory-saving flags for Render Free Tier
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -117,14 +132,6 @@ def run_bot():
         )
         page = context.new_page()
 
-        # Initial scrape to populate memory without posting
-        logger.info("Performing initial background scrape...")
-        for username in TWITTER_USERNAMES:
-            initial_tweets = scrape_twitter(username, page)
-            for tweet in initial_tweets:
-                seen_tweets[username].append(tweet['text'])
-            time.sleep(2)
-
         # Main polling loop
         while True:
             for username in TWITTER_USERNAMES:
@@ -134,16 +141,29 @@ def run_bot():
                 if current_tweets:
                     # Reverse so we process oldest-first
                     for tweet in reversed(current_tweets):
-                        if tweet['text'] not in seen_tweets[username]:
-                            logger.info(f"Found new tweet for @{username}!")
-                            send_tweet_to_telegram(username, tweet['text'], tweet['images'])
+                        tweet_text = tweet['text']
+                        
+                        # Check MongoDB to see if we already posted this exact text
+                        existing_post = posted_tweets.find_one({"text": tweet_text})
+                        
+                        if not existing_post:
+                            logger.info(f"Found brand new #ONEPIECE spoiler from @{username}!")
                             
-                            # Add to memory and keep memory size small
-                            seen_tweets[username].append(tweet['text'])
-                            if len(seen_tweets[username]) > 20:
-                                seen_tweets[username].pop(0)
+                            # 1. Send it to Telegram
+                            send_tweet_to_telegram(username, tweet_text, tweet['images'])
+                            
+                            # 2. Save it to MongoDB so we never post it again
+                            posted_tweets.insert_one({
+                                "text": tweet_text,
+                                "username": username,
+                                "timestamp": time.time()
+                            })
                             
                             time.sleep(1) # Gap between telegram posts
+                        else:
+                            logger.info(f"Spoiler already in database, skipping...")
+                else:
+                    logger.info(f"No #ONEPIECE tweets found for @{username}.")
                 
                 # Small delay before checking the next user
                 time.sleep(5)
