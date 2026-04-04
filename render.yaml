@@ -6,7 +6,9 @@ services:
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.8
+        value: 3.10.13
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/src/.playwright # This forces it to stay in your project
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHANNEL_ID
