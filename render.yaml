@@ -2,11 +2,9 @@ services:
   - type: web
     name: one-piece-spoiler-bot
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: python bot.py
     envVars:
-      - key: TWITTER_BEARER_TOKEN
-        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHANNEL_ID
