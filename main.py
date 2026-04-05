@@ -104,17 +104,25 @@ async def inject_cookies(context: BrowserContext) -> None:
 
 async def scrape_account(page: Page, username: str) -> list[dict]:
     results = []
+    url = f"https://x.com/{username}"
+    logger.info("Navigating to %s", url)
+
     try:
-        await page.goto(f"https://x.com/{username}", wait_until="domcontentloaded", timeout=60_000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # Log the title to see if we are stuck on a login or error page
+        title = await page.title()
+        logger.info("Page title for @%s: %s", username, title)
     except Exception as exc:
         logger.error("Navigation failed for @%s: %s", username, exc)
         return results
 
     try:
+        # If this fails, the log now tells us the Page Title above
         await page.wait_for_selector('article[data-testid="tweet"]', timeout=20_000)
     except Exception:
-        logger.warning("No tweets visible on @%s", username)
+        logger.warning("No tweets visible on @%s. Current URL: %s", username, page.url)
         return results
+    # ... rest of the function
 
     articles = await page.query_selector_all('article[data-testid="tweet"]')
     logger.info("Found %d articles on @%s", len(articles), username)
