@@ -2,7 +2,6 @@ services:
   - type: web
     name: one-piece-spoiler-bot
     runtime: python
-    pythonVersion: "3.11.0"
     buildCommand: pip install -r requirements.txt && playwright install chromium --with-deps
     startCommand: python main.py
     envVars:
