@@ -96,7 +96,8 @@ async def run_test():
                     images = []
                     for img in await article.query_selector_all('img[src*="pbs.twimg.com/media"]'):
                         src = await img.get_attribute("src") or ""
-                        images.append(f"{re.sub(r'\?.*$', '', src)}?format=jpg&name=large")
+                        clean_src = re.sub(r'\?.*$', '', src)
+                        images.append(f"{clean_src}?format=jpg&name=large")
                     
                     send_test_to_telegram(text, images)
                     break # Only process the first match for the test
