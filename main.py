@@ -24,9 +24,10 @@ MONGO_URI = os.environ["MONGO_URI"]
 TWITTER_AUTH_TOKEN = os.environ["TWITTER_AUTH_TOKEN"]
 TWITTER_CT0 = os.environ["TWITTER_CT0"]
 
-ACCOUNTS = ["pewpiece", "REIGEN326781"]
+# CHECK THIS: Your log showed @REIGEN32, ensure it matches your test account exactly!
+ACCOUNTS = ["pewpiece", "REIGEN326781"] 
 HASHTAG_RE = re.compile(r"#ONEPIECE\d+", re.IGNORECASE)
-POLL_INTERVAL = 30  # seconds
+POLL_INTERVAL = 30 
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
@@ -34,36 +35,59 @@ db = mongo_client["spoiler_bot"]
 posted_col = db["posted_tweets"]
 posted_col.create_index("tweet_id", unique=True)
 
-# ── Keepalive HTTP server (no Flask / no greenlet needed) ─────────────────────
+# ── Keepalive HTTP server ─────────────────────────────────────────────────────
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass  # suppress request noise
-
+    def log_message(self, *args): pass
 
 def start_http_server():
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), _Handler)
     logger.info("Keepalive server on port %d", port)
     server.serve_forever()
 
-# ── Telegram helpers ──────────────────────────────────────────────────────────
+# ── Telegram Listeners & Helpers ──────────────────────────────────────────────
 def _tg(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
         resp = requests.post(url, json=payload, timeout=30)
-        data = resp.json()
-        if not data.get("ok"):
-            logger.warning("Telegram %s failed: %s", method, data)
-        return data
+        return resp.json()
     except Exception as exc:
-        logger.error("Telegram request error: %s", exc)
+        logger.error("Telegram error: %s", exc)
         return {}
 
+async def run_telegram_listener():
+    """Listens for the /list command from you."""
+    last_update_id = 0
+    logger.info("Telegram command listener started")
+    while True:
+        try:
+            updates = _tg("getUpdates", {"offset": last_update_id + 1, "timeout": 20})
+            if updates.get("ok"):
+                for update in updates.get("result", []):
+                    last_update_id = update["update_id"]
+                    msg = update.get("message")
+                    if not msg or "text" not in msg: continue
+                    
+                    text = msg["text"].strip()
+                    chat_id = msg["chat"]["id"]
+                    
+                    if text == "/list":
+                        # Fetch last 10 spoilers recorded in MongoDB
+                        recent = list(posted_col.find().sort("_id", -1).limit(10))
+                        if not recent:
+                            _tg("sendMessage", {"chat_id": chat_id, "text": "❌ No spoilers recorded in database yet."})
+                        else:
+                            response = "<b>📜 Latest 10 Recorded Spoilers:</b>\n\n"
+                            for i, t in enumerate(recent, 1):
+                                response += f"{i}. <b>@{t['username']}</b>\n{t['text'][:100]}...\n\n"
+                            _tg("sendMessage", {"chat_id": chat_id, "text": response, "parse_mode": "HTML"})
+        except Exception as e:
+            logger.error("TG Listener error: %s", e)
+        await asyncio.sleep(2)
 
 def send_to_telegram(username: str, text: str, images: list[str]) -> None:
     caption = f"🏴‍☠️ <b>One Piece Spoiler</b> — <i>@{username}</i>\n\n{text}"
@@ -77,139 +101,76 @@ def send_to_telegram(username: str, text: str, images: list[str]) -> None:
         media[0]["parse_mode"] = "HTML"
         _tg("sendMediaGroup", {"chat_id": TELEGRAM_CHANNEL_ID, "media": media})
 
-# ── Playwright config ─────────────────────────────────────────────────────────
-CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH") or None  # None = use Playwright's own
-
-BROWSER_ARGS = [
-    "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-    "--disable-setuid-sandbox", "--single-process",
-    "--disable-extensions", "--no-first-run",
-]
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-async def inject_cookies(context: BrowserContext) -> None:
-    await context.add_cookies([
-        {"name": "auth_token", "value": TWITTER_AUTH_TOKEN, "domain": ".x.com",
-         "path": "/", "httpOnly": True, "secure": True, "sameSite": "None"},
-        {"name": "ct0", "value": TWITTER_CT0, "domain": ".x.com",
-         "path": "/", "httpOnly": False, "secure": True, "sameSite": "Lax"},
-    ])
-
-
+# ── Stealth Scraper Logic ─────────────────────────────────────────────────────
 async def scrape_account(page: Page, username: str) -> list[dict]:
     results = []
-    url = f"https://x.com/{username}"
-    logger.info("Navigating to %s", url)
-
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        # Log the title to see if we are stuck on a login or error page
+        # Navigate and wait for content
+        await page.goto(f"https://x.com/{username}", wait_until="networkidle", timeout=60_000)
+        await page.wait_for_timeout(5000) # Give it extra time to render
+        
         title = await page.title()
         logger.info("Page title for @%s: %s", username, title)
-    except Exception as exc:
-        logger.error("Navigation failed for @%s: %s", username, exc)
-        return results
+        
+        if "login" in page.url or not title:
+            logger.warning("X is blocking the scraper or cookies expired for @%s", username)
+            return results
 
-    try:
-        # If this fails, the log now tells us the Page Title above
-        await page.wait_for_selector('article[data-testid="tweet"]', timeout=20_000)
-    except Exception:
-        logger.warning("No tweets visible on @%s. Current URL: %s", username, page.url)
-        return results
-    # ... rest of the function
-
-    articles = await page.query_selector_all('article[data-testid="tweet"]')
-    logger.info("Found %d articles on @%s", len(articles), username)
-
-    for article in articles[:15]:
-        try:
+        await page.wait_for_selector('article[data-testid="tweet"]', timeout=15_000)
+        articles = await page.query_selector_all('article[data-testid="tweet"]')
+        
+        for article in articles[:10]:
             text_el = await article.query_selector('[data-testid="tweetText"]')
             text = await text_el.inner_text() if text_el else ""
-
-            if not HASHTAG_RE.search(text):
-                continue
+            if not HASHTAG_RE.search(text): continue
 
             link_el = await article.query_selector('a[href*="/status/"]')
-            if not link_el:
-                continue
+            if not link_el: continue
             href = await link_el.get_attribute("href") or ""
             m = re.search(r"/status/(\d+)", href)
-            if not m:
-                continue
+            if not m: continue
             tweet_id = m.group(1)
 
-            images: list[str] = []
+            images = []
             for img in await article.query_selector_all('img[src*="pbs.twimg.com/media"]'):
                 src = await img.get_attribute("src") or ""
                 clean = re.sub(r"\?.*$", "", src)
-                if clean:
-                    images.append(f"{clean}?format=jpg&name=large")
+                if clean: images.append(f"{clean}?format=jpg&name=large")
 
             results.append({"tweet_id": tweet_id, "text": text, "images": images, "username": username})
-            logger.info("Matched tweet %s from @%s (%d image(s))", tweet_id, username, len(images))
-
-        except Exception as exc:
-            logger.error("Error parsing article: %s", exc)
-
+    except Exception as exc:
+        logger.error("Scrape failed for @%s: %s", username, exc)
     return results
 
-
 async def run_scraper() -> None:
-    logger.info("Scraper started — polling every %ds", POLL_INTERVAL)
+    async with async_playwright() as pw:
+        # STEALTH ARGS added here
+        browser = await pw.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled"
+        ])
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        await context.add_cookies([
+            {"name": "auth_token", "value": TWITTER_AUTH_TOKEN, "domain": ".x.com", "path": "/", "httpOnly": True, "secure": True},
+            {"name": "ct0", "value": TWITTER_CT0, "domain": ".x.com", "path": "/", "httpOnly": False, "secure": True},
+        ])
+        page = await context.new_page()
 
-    while True:
-        try:
-            async with async_playwright() as pw:
-                launch_kwargs = {"headless": True, "args": BROWSER_ARGS}
-                if CHROMIUM_PATH:
-                    launch_kwargs["executable_path"] = CHROMIUM_PATH
-                browser = await pw.chromium.launch(**launch_kwargs)
-                context = await browser.new_context(
-                    user_agent=USER_AGENT, locale="en-US",
-                    viewport={"width": 1280, "height": 900},
-                )
-                await inject_cookies(context)
-                page = await context.new_page()
-
-                # Verify session
-                await page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=60_000)
-                await page.wait_for_timeout(2000)
-                if "login" in page.url:
-                    logger.error("Session cookies expired — update TWITTER_AUTH_TOKEN and TWITTER_CT0")
-                    await browser.close()
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
-                logger.info("Session valid")
-
-                for username in ACCOUNTS:
-                    tweets = await scrape_account(page, username)
-                    for tweet in tweets:
-                        tid = tweet["tweet_id"]
-                        if posted_col.find_one({"tweet_id": tid}):
-                            logger.info("Already posted %s — skipping", tid)
-                            continue
-                        logger.info("Sending %s from @%s to Telegram", tid, tweet["username"])
+        while True:
+            for username in ACCOUNTS:
+                tweets = await scrape_account(page, username)
+                for tweet in tweets:
+                    if not posted_col.find_one({"tweet_id": tweet["tweet_id"]}):
                         send_to_telegram(tweet["username"], tweet["text"], tweet["images"])
-                        posted_col.insert_one({"tweet_id": tid, "text": tweet["text"], "username": tweet["username"]})
-                        await asyncio.sleep(1)
+                        posted_col.insert_one({"tweet_id": tweet["tweet_id"], "text": tweet["text"], "username": tweet["username"], "ts": time.time()})
+                await asyncio.sleep(5)
+            await asyncio.sleep(POLL_INTERVAL)
 
-                await browser.close()
-
-        except Exception as exc:
-            logger.error("Scraper cycle error: %s", exc, exc_info=True)
-
-        logger.info("Sleeping %ds...", POLL_INTERVAL)
-        await asyncio.sleep(POLL_INTERVAL)
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    http_thread = threading.Thread(target=start_http_server, daemon=True)
-    http_thread.start()
-    asyncio.run(run_scraper())
+    threading.Thread(target=start_http_server, daemon=True).start()
+    # Run both the scraper and the Telegram listener
+    loop = asyncio.get_event_loop()
+    loop.create_task(run_telegram_listener())
+    loop.run_until_complete(run_scraper())
