@@ -98,8 +98,11 @@ async def run_telegram_listener():
 async def scrape_account(page: Page, username: str) -> list[dict]:
     results = []
     try:
+        # Step 1: Go to the page and give it time to load the basic layout
         await page.goto(f"https://x.com/{username}", wait_until="domcontentloaded", timeout=60_000)
-        await page.wait_for_timeout(4000)
+        
+        # Give Render's slow CPU 5 full seconds to process Twitter's JavaScript
+        await page.wait_for_timeout(5000) 
         
         title = await page.title()
         logger.info("Page title for @%s: %s", username, title)
@@ -108,8 +111,12 @@ async def scrape_account(page: Page, username: str) -> list[dict]:
             logger.warning("X served a blank page. Bot check or slow load for @%s", username)
             return results
 
-        await page.wait_for_selector('article[data-testid="tweet"]', timeout=15_000)
+        # Step 2: Wait UP TO 30 SECONDS for the actual tweets to render on the screen
+        logger.info("Waiting for tweets to render on @%s...", username)
+        await page.wait_for_selector('article[data-testid="tweet"]', timeout=30_000)
+        
         articles = await page.query_selector_all('article[data-testid="tweet"]')
+        logger.info("Success! Found %d tweets on @%s's page.", len(articles), username)
         
         for article in articles[:10]:
             text_el = await article.query_selector('[data-testid="tweetText"]')
@@ -130,10 +137,11 @@ async def scrape_account(page: Page, username: str) -> list[dict]:
                 images.append(f"{clean_src}?format=jpg&name=large")
 
             results.append({"tweet_id": tweet_id, "text": text, "images": images, "username": username})
+            
     except Exception as exc:
         logger.error("Scrape failed for @%s: %s", username, exc)
     return results
-
+    
 async def run_scraper() -> None:
     logger.info("Scraper started — polling every %ds", POLL_INTERVAL)
     async with async_playwright() as pw:
