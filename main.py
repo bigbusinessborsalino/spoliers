@@ -22,7 +22,7 @@ MONGO_URI = os.environ.get("MONGO_URI")
 TWITTER_AUTH_TOKEN = os.environ.get("TWITTER_AUTH_TOKEN")
 TWITTER_CT0 = os.environ.get("TWITTER_CT0")
 
-ACCOUNTS = ["pewpiece", "REIGEN326781"] 
+ACCOUNTS = ["REIGEN326781"] 
 HASHTAG_RE = re.compile(r"#ONEPIECE\d+", re.IGNORECASE)
 POLL_INTERVAL = 30 
 
