@@ -2,12 +2,14 @@ services:
   - type: web
     name: one-piece-spoiler-bot
     runtime: python
-    # Removed --with-deps because Render doesn't allow root access
-    buildCommand: pip install -r requirements.txt && playwright install chromium
+    # We force the browser to install inside your project directory
+    buildCommand: pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.playwright playwright install chromium
     startCommand: python main.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.8
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/src/.playwright
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHANNEL_ID
