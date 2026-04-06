@@ -22,10 +22,13 @@ MONGO_URI = os.environ.get("MONGO_URI")
 TWITTER_AUTH_TOKEN = os.environ.get("TWITTER_AUTH_TOKEN")
 TWITTER_CT0 = os.environ.get("TWITTER_CT0")
 
-# ONLY checking your test account right now
-ACCOUNTS = ["REIGEN326781"] 
+# Checking both accounts now
+ACCOUNTS = ["pewpiece", "REIGEN326781"] 
 HASHTAG_RE = re.compile(r"#ONEPIECE\d+", re.IGNORECASE)
 POLL_INTERVAL = 45 
+
+# Global trigger for the /latest command
+FORCE_CHECK = False
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
@@ -53,7 +56,10 @@ def _tg(method: str, payload: dict) -> dict:
         resp = requests.post(url, json=payload, timeout=30)
         data = resp.json()
         if not data.get("ok"):
-            logger.error("❌ Telegram %s FAILED: %s", method, data.get('description'))
+            err_msg = data.get("description", "")
+            # Suppress the Render overlap spam in the logs
+            if "Conflict" not in err_msg:
+                logger.error("❌ Telegram %s FAILED: %s", method, err_msg)
         return data
     except Exception as exc:
         logger.error("Telegram request error: %s", exc)
@@ -73,10 +79,47 @@ def send_to_telegram(username: str, text: str, images: list[str]) -> None:
         media[0]["parse_mode"] = "HTML"
         _tg("sendMediaGroup", {"chat_id": TELEGRAM_CHANNEL_ID, "media": media})
 
+# ── Command Listener ─────────────────────────────────────────────────────────
+async def run_telegram_listener():
+    global FORCE_CHECK
+    # Force drop old webhooks to help with Replit/Render conflicts
+    _tg("deleteWebhook", {"drop_pending_updates": True})
+    
+    last_update_id = 0
+    logger.info("Telegram command listener started")
+    while True:
+        try:
+            updates = _tg("getUpdates", {"offset": last_update_id + 1, "timeout": 20})
+            
+            if updates and updates.get("ok"):
+                for update in updates.get("result", []):
+                    last_update_id = update["update_id"]
+                    msg = update.get("message")
+                    if not msg or "text" not in msg: continue
+                    
+                    text = msg["text"].strip().lower()
+                    if text == "/latest" or text == "/list":
+                        # 1. Trigger the scraper to run IMMEDIATELY and upload
+                        FORCE_CHECK = True
+                        _tg("sendMessage", {
+                            "chat_id": msg["chat"]["id"], 
+                            "text": "⚡ <b>Forcing immediate check on Twitter for new spoilers...</b>\nIf any are found, they will be uploaded to the channel now.", 
+                            "parse_mode": "HTML"
+                        })
+                        
+                        # 2. Show what is currently saved in the database
+                        recent = list(posted_col.find().sort("_id", -1).limit(5))
+                        if not recent:
+                            resp = "❌ No spoilers recorded in database yet."
+                        else:
+                            resp = "<b>📜 Last 5 Recorded Spoilers:</b>\n\n" + "\n".join([f"@{t['username']}: {t['text'][:60]}..." for t in recent])
+                        _tg("sendMessage", {"chat_id": msg["chat"]["id"], "text": resp, "parse_mode": "HTML"})
+        except Exception: 
+            pass
+        await asyncio.sleep(2)
+
 # ── Memory Optimization Route ─────────────────────────────────────────────────
 async def block_heavy_resources(route: Route):
-    # This stops Chromium from downloading images, fonts, and stylesheets. 
-    # This saves massive amounts of RAM and prevents the 512MB crash.
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
         await route.abort()
     else:
@@ -111,8 +154,6 @@ async def scrape_account(page: Page, username: str) -> list[dict]:
             if not m: continue
             tweet_id = m.group(1)
 
-            # Even though we block images from loading to save RAM, 
-            # we can still extract their URLs to send to Telegram
             images = []
             for img in await article.query_selector_all('img[src*="pbs.twimg.com/media"]'):
                 src = await img.get_attribute("src") or ""
@@ -125,27 +166,26 @@ async def scrape_account(page: Page, username: str) -> list[dict]:
     return results
 
 async def run_scraper() -> None:
+    global FORCE_CHECK
     logger.info("Scraper started — polling every %ds", POLL_INTERVAL)
     async with async_playwright() as pw:
         browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
         executable = f"{browser_path}/chromium-1117/chrome-linux/chrome" if browser_path else None
         
-        # EXTREME MEMORY SAVING ARGS
         launch_kwargs = {
             "headless": True, 
             "args": [
                 "--no-sandbox", 
                 "--disable-gpu", 
                 "--disable-dev-shm-usage", 
-                "--single-process",        # Forces single thread (saves RAM)
-                "--no-zygote",             # Disables memory-heavy sandboxing processes
+                "--single-process", 
+                "--no-zygote", 
                 "--disable-blink-features=AutomationControlled"
             ]
         }
         if executable and os.path.exists(executable):
             launch_kwargs["executable_path"] = executable
 
-        # We keep one browser open, but create fresh contexts to avoid leaks
         browser = await pw.chromium.launch(**launch_kwargs)
 
         while True:
@@ -157,7 +197,6 @@ async def run_scraper() -> None:
                 ])
                 
                 page = await context.new_page()
-                # Apply the memory optimization to block heavy UI elements
                 await page.route("**/*", block_heavy_resources)
                 
                 for username in ACCOUNTS:
@@ -168,15 +207,23 @@ async def run_scraper() -> None:
                             send_to_telegram(tweet["username"], tweet["text"], tweet["images"])
                             posted_col.insert_one({"tweet_id": tweet["tweet_id"], "text": tweet["text"], "username": tweet["username"]})
                 
-                # Close the context to dump the memory entirely
                 await context.close() 
                 
             except Exception as e:
                 logger.error("Cycle error: %s", e)
                 
-            await asyncio.sleep(POLL_INTERVAL)
+            # Smart waiting: Break the sleep immediately if /latest command is used
+            for _ in range(POLL_INTERVAL):
+                if FORCE_CHECK:
+                    logger.info("⚡ /latest command received! Skipping wait timer...")
+                    FORCE_CHECK = False
+                    break
+                await asyncio.sleep(1)
 
 if __name__ == "__main__":
     threading.Thread(target=start_http_server, daemon=True).start()
-    # Removed the Telegram Listener temporarily so it doesn't fight Replit
-    asyncio.run(run_scraper())
+    
+    # Run both the scraper and the Telegram listener together
+    loop = asyncio.get_event_loop()
+    loop.create_task(run_telegram_listener())
+    loop.run_until_complete(run_scraper())
