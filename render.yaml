@@ -2,14 +2,9 @@ services:
   - type: web
     name: one-piece-spoiler-bot
     runtime: python
-    # We force the browser to install inside your project directory
-    buildCommand: pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.playwright playwright install chromium
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.8
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/src/.playwright
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHANNEL_ID
@@ -19,4 +14,6 @@ services:
       - key: TWITTER_AUTH_TOKEN
         sync: false
       - key: TWITTER_CT0
+        sync: false
+      - key: TWITTER_USERNAME
         sync: false
