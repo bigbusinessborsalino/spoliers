@@ -99,12 +99,12 @@ async def run_telegram_listener():
                     
                     text = msg["text"].strip().lower()
                     
-                    # Command 1: Check status and force new scan
+                    # Command 1: /latest or /list
                     if text == "/latest" or text == "/list":
                         FORCE_CHECK = True
                         _tg("sendMessage", {
                             "chat_id": msg["chat"]["id"], 
-                            "text": "⚡ <b>Forcing immediate check on Twitter for new spoilers...</b>\nIf any are found, they will be uploaded to the channel now.", 
+                            "text": "⚡ <b>Forcing immediate check on Twitter for new spoilers...</b>", 
                             "parse_mode": "HTML"
                         })
                         
@@ -115,21 +115,37 @@ async def run_telegram_listener():
                             resp = "<b>📜 Last 5 Recorded Spoilers:</b>\n\n" + "\n".join([f"@{t['username']}: {t['text'][:60]}..." for t in recent])
                         _tg("sendMessage", {"chat_id": msg["chat"]["id"], "text": resp, "parse_mode": "HTML"})
                     
-                    # Command 2: Wipe memory and force repost
-                    elif text == "/repost":
-                        # This deletes everything from the database
-                        posted_col.delete_many({}) 
-                        # This skips the timer and forces an immediate check
+                    # Command 2: /repost [hashtag] or just /repost
+                    elif text.startswith("/repost"):
+                        parts = text.split(maxsplit=1)
+                        
+                        if len(parts) > 1:
+                            # They typed something like: /repost #onepiece1180
+                            target_tag = parts[1].strip()
+                            
+                            # Tell MongoDB to only delete tweets containing this exact tag
+                            result = posted_col.delete_many({"text": {"$regex": target_tag, "$options": "i"}})
+                            
+                            if result.deleted_count > 0:
+                                msg_text = f"🗑️ <b>Deleted {result.deleted_count} tweet(s) matching {html.escape(target_tag)}!</b>\nChecking Twitter now to repost..."
+                            else:
+                                msg_text = f"⚠️ <b>No tweets found in memory matching {html.escape(target_tag)}.</b>\nChecking Twitter anyway just in case..."
+                        else:
+                            # They just typed: /repost (Wipe everything)
+                            posted_col.delete_many({}) 
+                            msg_text = "🗑️ <b>All Memory Wiped!</b>\nThe bot forgot all past tweets and is checking Twitter right now."
+                        
                         FORCE_CHECK = True         
                         _tg("sendMessage", {
                             "chat_id": msg["chat"]["id"], 
-                            "text": "🗑️ <b>Memory Wiped!</b>\nThe bot forgot all past tweets and is checking Twitter right now. It will post everything it finds directly to the channel.", 
+                            "text": msg_text, 
                             "parse_mode": "HTML"
                         })
                         
         except Exception: 
             pass
         await asyncio.sleep(2)
+        
 # ── Memory Optimization Route ─────────────────────────────────────────────────
 async def block_heavy_resources(route: Route):
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
