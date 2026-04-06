@@ -153,7 +153,9 @@ async def scrape_account(page: Page, username: str) -> list[dict]:
             logger.warning("X served a blank page. Bot check or slow load for @%s", username)
             return results
 
-        await page.wait_for_selector('article[data-testid="tweet"]', timeout=20_000)
+        logger.info("Waiting for Render's slow CPU to load tweets for @%s...", username)
+        # Bumped to 45 seconds (45_000ms) to survive the free tier lag
+        await page.wait_for_selector('article[data-testid="tweet"]', timeout=45_000)
         articles = await page.query_selector_all('article[data-testid="tweet"]')
         
         for article in articles[:10]:
