@@ -22,13 +22,13 @@ MONGO_URI = os.environ.get("MONGO_URI")
 TWITTER_AUTH_TOKEN = os.environ.get("TWITTER_AUTH_TOKEN")
 TWITTER_CT0 = os.environ.get("TWITTER_CT0")
 
-# Checking both accounts now
 ACCOUNTS = ["pewpiece", "REIGEN326781"] 
 HASHTAG_RE = re.compile(r"#ONEPIECE\d+", re.IGNORECASE)
 POLL_INTERVAL = 45 
 
-# Global trigger for the /latest command
+# Triggers
 FORCE_CHECK = False
+ON_DEMAND_SCAN = False
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
 mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
@@ -57,7 +57,6 @@ def _tg(method: str, payload: dict) -> dict:
         data = resp.json()
         if not data.get("ok"):
             err_msg = data.get("description", "")
-            # Suppress the Render overlap spam in the logs
             if "Conflict" not in err_msg:
                 logger.error("❌ Telegram %s FAILED: %s", method, err_msg)
         return data
@@ -81,8 +80,7 @@ def send_to_telegram(username: str, text: str, images: list[str]) -> None:
 
 # ── Command Listener ─────────────────────────────────────────────────────────
 async def run_telegram_listener():
-    global FORCE_CHECK
-    # Force drop old webhooks to help with Replit/Render conflicts
+    global FORCE_CHECK, ON_DEMAND_SCAN
     _tg("deleteWebhook", {"drop_pending_updates": True})
     
     last_update_id = 0
@@ -99,39 +97,27 @@ async def run_telegram_listener():
                     
                     text = msg["text"].strip().lower()
                     
-                    # Command 1: /latest or /list
+                    # LIVE SCAN: /latest
                     if text == "/latest" or text == "/list":
                         FORCE_CHECK = True
+                        ON_DEMAND_SCAN = True
                         _tg("sendMessage", {
                             "chat_id": msg["chat"]["id"], 
-                            "text": "⚡ <b>Forcing immediate check on Twitter for new spoilers...</b>", 
+                            "text": "⏳ **Live Scanning Twitter now...**\nBypassing the database. Fetching the absolute newest spoiler from both accounts directly to the channel.", 
                             "parse_mode": "HTML"
                         })
-                        
-                        recent = list(posted_col.find().sort("_id", -1).limit(5))
-                        if not recent:
-                            resp = "❌ No spoilers recorded in database yet."
-                        else:
-                            resp = "<b>📜 Last 5 Recorded Spoilers:</b>\n\n" + "\n".join([f"@{t['username']}: {t['text'][:60]}..." for t in recent])
-                        _tg("sendMessage", {"chat_id": msg["chat"]["id"], "text": resp, "parse_mode": "HTML"})
                     
-                    # Command 2: /repost [hashtag] or just /repost
+                    # WIPE MEMORY: /repost
                     elif text.startswith("/repost"):
                         parts = text.split(maxsplit=1)
-                        
                         if len(parts) > 1:
-                            # They typed something like: /repost #onepiece1180
                             target_tag = parts[1].strip()
-                            
-                            # Tell MongoDB to only delete tweets containing this exact tag
                             result = posted_col.delete_many({"text": {"$regex": target_tag, "$options": "i"}})
-                            
                             if result.deleted_count > 0:
                                 msg_text = f"🗑️ <b>Deleted {result.deleted_count} tweet(s) matching {html.escape(target_tag)}!</b>\nChecking Twitter now to repost..."
                             else:
                                 msg_text = f"⚠️ <b>No tweets found in memory matching {html.escape(target_tag)}.</b>\nChecking Twitter anyway just in case..."
                         else:
-                            # They just typed: /repost (Wipe everything)
                             posted_col.delete_many({}) 
                             msg_text = "🗑️ <b>All Memory Wiped!</b>\nThe bot forgot all past tweets and is checking Twitter right now."
                         
@@ -145,7 +131,7 @@ async def run_telegram_listener():
         except Exception: 
             pass
         await asyncio.sleep(2)
-        
+
 # ── Memory Optimization Route ─────────────────────────────────────────────────
 async def block_heavy_resources(route: Route):
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
@@ -194,7 +180,7 @@ async def scrape_account(page: Page, username: str) -> list[dict]:
     return results
 
 async def run_scraper() -> None:
-    global FORCE_CHECK
+    global FORCE_CHECK, ON_DEMAND_SCAN
     logger.info("Scraper started — polling every %ds", POLL_INTERVAL)
     async with async_playwright() as pw:
         browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
@@ -229,29 +215,38 @@ async def run_scraper() -> None:
                 
                 for username in ACCOUNTS:
                     tweets = await scrape_account(page, username)
-                    for tweet in reversed(tweets):
-                        if not posted_col.find_one({"tweet_id": tweet["tweet_id"]}):
-                            logger.info("🎯 Found new tweet %s! Sending to Telegram...", tweet['tweet_id'])
-                            send_to_telegram(tweet["username"], tweet["text"], tweet["images"])
-                            posted_col.insert_one({"tweet_id": tweet["tweet_id"], "text": tweet["text"], "username": tweet["username"]})
+                    
+                    if ON_DEMAND_SCAN:
+                        # Only take the very newest tweet during a /latest live scan
+                        if tweets:
+                            newest_tweet = tweets[0]
+                            logger.info("⚡ LIVE SCAN: Forcing newest tweet %s to channel!", newest_tweet['tweet_id'])
+                            send_to_telegram(newest_tweet["username"], newest_tweet["text"], newest_tweet["images"])
+                    else:
+                        # Normal background scanning
+                        for tweet in reversed(tweets):
+                            if not posted_col.find_one({"tweet_id": tweet["tweet_id"]}):
+                                logger.info("🎯 Found new tweet %s! Sending to Telegram...", tweet['tweet_id'])
+                                send_to_telegram(tweet["username"], tweet["text"], tweet["images"])
+                                posted_col.insert_one({"tweet_id": tweet["tweet_id"], "text": tweet["text"], "username": tweet["username"]})
                 
+                if ON_DEMAND_SCAN:
+                    ON_DEMAND_SCAN = False # Turn off live scan after we finish checking both accounts
+                    
                 await context.close() 
                 
             except Exception as e:
                 logger.error("Cycle error: %s", e)
                 
-            # Smart waiting: Break the sleep immediately if /latest command is used
             for _ in range(POLL_INTERVAL):
                 if FORCE_CHECK:
-                    logger.info("⚡ /latest command received! Skipping wait timer...")
+                    logger.info("⚡ Command received! Skipping wait timer...")
                     FORCE_CHECK = False
                     break
                 await asyncio.sleep(1)
 
 if __name__ == "__main__":
     threading.Thread(target=start_http_server, daemon=True).start()
-    
-    # Run both the scraper and the Telegram listener together
     loop = asyncio.get_event_loop()
     loop.create_task(run_telegram_listener())
     loop.run_until_complete(run_scraper())
