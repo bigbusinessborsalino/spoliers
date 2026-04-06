@@ -98,8 +98,9 @@ async def run_telegram_listener():
                     if not msg or "text" not in msg: continue
                     
                     text = msg["text"].strip().lower()
+                    
+                    # Command 1: Check status and force new scan
                     if text == "/latest" or text == "/list":
-                        # 1. Trigger the scraper to run IMMEDIATELY and upload
                         FORCE_CHECK = True
                         _tg("sendMessage", {
                             "chat_id": msg["chat"]["id"], 
@@ -107,17 +108,28 @@ async def run_telegram_listener():
                             "parse_mode": "HTML"
                         })
                         
-                        # 2. Show what is currently saved in the database
                         recent = list(posted_col.find().sort("_id", -1).limit(5))
                         if not recent:
                             resp = "❌ No spoilers recorded in database yet."
                         else:
                             resp = "<b>📜 Last 5 Recorded Spoilers:</b>\n\n" + "\n".join([f"@{t['username']}: {t['text'][:60]}..." for t in recent])
                         _tg("sendMessage", {"chat_id": msg["chat"]["id"], "text": resp, "parse_mode": "HTML"})
+                    
+                    # Command 2: Wipe memory and force repost
+                    elif text == "/repost":
+                        # This deletes everything from the database
+                        posted_col.delete_many({}) 
+                        # This skips the timer and forces an immediate check
+                        FORCE_CHECK = True         
+                        _tg("sendMessage", {
+                            "chat_id": msg["chat"]["id"], 
+                            "text": "🗑️ <b>Memory Wiped!</b>\nThe bot forgot all past tweets and is checking Twitter right now. It will post everything it finds directly to the channel.", 
+                            "parse_mode": "HTML"
+                        })
+                        
         except Exception: 
             pass
         await asyncio.sleep(2)
-
 # ── Memory Optimization Route ─────────────────────────────────────────────────
 async def block_heavy_resources(route: Route):
     if route.request.resource_type in ["image", "media", "font", "stylesheet"]:
